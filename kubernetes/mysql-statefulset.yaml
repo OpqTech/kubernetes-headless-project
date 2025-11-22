@@ -15,7 +15,7 @@ data:
     [mysqld]
     super-read-only    
 ---
-# Headless service for stable DNS entries of StatefulSet members.
+
 apiVersion: v1
 kind: Service
 metadata:
@@ -29,8 +29,7 @@ spec:
     app: mysql
   type: ClusterIP
 ---
-# Client service for connecting to any MySQL instance for reads.
-# For writes, you must instead connect to the primary: mysql-0.mysql.
+
 apiVersion: v1
 kind: Service
 metadata:
@@ -83,13 +82,13 @@ spec:
         - "-c"
         - |
           set -ex
-          # Generate mysql server-id from pod ordinal index.
+
           [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
           ordinal=${BASH_REMATCH[1]}
           echo "[mysqld]" > /mnt/conf.d/server-id.cnf
-          # Add an offset to avoid reserved server-id=0 value.
+
           echo "server-id=$((100 + $ordinal))" >> /mnt/conf.d/server-id.cnf
-          # Copy appropriate conf.d files from config-map to emptyDir.
+
           if [[ $ordinal -eq 0 ]]; then
             cp /mnt/config-map/primary.cnf /mnt/conf.d/
           else
@@ -107,18 +106,71 @@ spec:
         - "-c"
         - |
           set -ex
-          # Skip the clone if data already exists.
           [[ -d /var/lib/mysql/mysql ]] && exit 0
-          # Skip the clone on primary (ordinal index 0).
           [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
           ordinal=${BASH_REMATCH[1]}
           [[ $ordinal -eq 0 ]] && exit 0
-          # Clone data from previous peer using socat.
-          echo "Cloning from mysql-$(($ordinal-1)).mysql using socat..."
-          socat TCP:mysql-$(($ordinal-1)).mysql:3307 STDOUT | xbstream -x -C /var/lib/mysql
-          # Prepare the backup.
+          
+          if ! command -v socat &> /dev/null; then
+            microdnf install -y --setopt=install_weak_deps=0 socat || yum install -y socat || apt-get update && apt-get install -y socat
+          fi
+          
+          peer="mysql-$(($ordinal-1)).mysql"
+          max_attempts=10
+          attempt=0
+          
+          echo "Waiting for $peer to be fully ready..."
+          sleep 30
+          
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt + 1))
+            echo "Clone attempt $attempt/$max_attempts from $peer"
+            
+            if [ $attempt -gt 1 ]; then
+              rm -rf /var/lib/mysql/*
+            fi
+            
+            set +e
+            socat TCP:$peer:3307 STDOUT 2> /tmp/socat_err.log | xbstream -x -C /var/lib/mysql 2> /tmp/xbstream_err.log
+            clone_exit=$?
+            set -e
+            
+            if [ -f /var/lib/mysql/xtrabackup_checkpoints ]; then
+              echo "Clone successful on attempt $attempt"
+              rm -f /tmp/socat_err.log /tmp/xbstream_err.log
+              break
+            fi
+            
+            if [ -s /tmp/socat_err.log ]; then
+              echo "socat errors:"
+              cat /tmp/socat_err.log
+            fi
+            if [ -s /tmp/xbstream_err.log ]; then
+              echo "xbstream errors:"
+              cat /tmp/xbstream_err.log
+            fi
+            
+            if [ $attempt -eq $max_attempts ]; then
+              echo "ERROR: Unable to clone from $peer after $max_attempts attempts"
+              exit 1
+            fi
+            
+            echo "Clone attempt $attempt failed (exit code: $clone_exit). Retrying..."
+            sleep 10
+          done
+          
+          if [ ! -f /var/lib/mysql/xtrabackup_checkpoints ]; then
+            echo "ERROR: Backup extraction failed - xtrabackup_checkpoints not found"
+            echo "Contents of /var/lib/mysql:"
+            ls -la /var/lib/mysql/ || true
+            exit 1
+          fi
+          
           echo "Preparing backup..."
-          xtrabackup --prepare --target-dir=/var/lib/mysql
+          if ! xtrabackup --prepare --target-dir=/var/lib/mysql; then
+            echo "ERROR: Failed to prepare backup"
+            exit 1
+          fi
           echo "Clone and prepare complete."
         volumeMounts:
         - name: data
@@ -162,6 +214,8 @@ spec:
         ports:
         - name: xtrabackup
           containerPort: 3307
+        securityContext:
+          runAsUser: 0
         command:
         - bash
         - "-c"
@@ -170,7 +224,6 @@ spec:
           set -ex
           cd /var/lib/mysql
 
-          # Determine binlog position of cloned data, if any.
           if [[ -f xtrabackup_slave_info && "x$(<xtrabackup_slave_info)" != "x" ]]; then
             cat xtrabackup_slave_info | sed -E 's/;$//g' > change_master_to.sql.in
             rm -f xtrabackup_slave_info xtrabackup_binlog_info
@@ -182,14 +235,16 @@ spec:
                   MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
           fi
 
-          # Check if we need to complete a clone by starting replication.
-          # This requires the 'mysql' command-line client in the image.
-          if [[ -f change_master_to.sql.in ]]; then
-            echo "Waiting for mysqld to be ready (accepting connections)"
-            until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 1; done
+          echo "Waiting for mysqld to be ready (accepting connections)..."
+          until mysql -u root -h 127.0.0.1 -e "SELECT 1" 2>/dev/null; do 
+            echo "MySQL not ready yet, waiting..."
+            sleep 2
+          done
+          echo "MySQL is ready!"
 
+          if [[ -f change_master_to.sql.in ]]; then
             echo "Initializing replication from clone position"
-            mysql -h 127.0.0.1 \
+            mysql -u root -h 127.0.0.1 \
                   -e "$(<change_master_to.sql.in), \
                           MASTER_HOST='mysql-0.mysql', \
                           MASTER_USER='root', \
@@ -199,7 +254,6 @@ spec:
             mv change_master_to.sql.in change_master_to.sql.orig
           fi
 
-          # Start a server to send backups when requested by peers using socat.
           echo "Starting XtraBackup server on port 3307 using socat..."
           exec socat TCP-LISTEN:3307,fork,reuseaddr EXEC:'xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root'
         volumeMounts:
